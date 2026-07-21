@@ -809,6 +809,20 @@ class MemoryTimeseriesBucketData:
         }
 
 
+# Safety margin subtracted from a refresh's snapshot cutoff before it is persisted
+# as ``mental_models.last_refreshed_at``. ``memory_units.updated_at`` is stamped with
+# the writing transaction's start time (Postgres ``now()``), but a row only becomes
+# visible to other connections at COMMIT — which can land *after* a concurrent
+# refresh captured its snapshot. Persisting the exact cutoff would leave such a
+# straddling row permanently below the watermark (``updated_at <= cutoff``) even
+# though reflect never saw it, silently dropping it from every future refresh.
+# Backing the watermark off by more than any ``memory_units`` write transaction can
+# stay open makes the only failure direction a harmless re-refresh, never a skipped
+# memory. Retain writes the batch inside a short DB-bound transaction (LLM/embedding
+# work happens beforehand, outside it), so a few minutes is comfortably conservative.
+_DELTA_WATERMARK_SAFETY_MARGIN = timedelta(minutes=5)
+
+
 @dataclass(frozen=True)
 class RefreshTagFiltering:
     """Resolved tag filtering parameters for mental model refresh."""
@@ -10837,9 +10851,9 @@ class MemoryEngine(MemoryEngineInterface):
 
             tag_filtering = _resolve_refresh_tag_filtering(mental_model.get("tags"), trigger_data)
 
-            # Bound this refresh to a database-time snapshot. Facts arriving while
-            # reflect is running must remain newer than the persisted watermark so
-            # a later refresh can still see them.
+            # Bound this refresh to a database-time snapshot. Reflect only reads
+            # facts committed at/before this cutoff (``created_before`` below), so a
+            # fact arriving while reflect runs stays unseen this round.
             backend = await self._get_backend()
             assert self._dialect is not None
             async with acquire_with_retry(backend) as conn:
@@ -10851,6 +10865,12 @@ class MemoryEngine(MemoryEngineInterface):
                 )
             if refresh_cutoff is None:
                 return None
+            # The recall snapshot is bounded by ``refresh_cutoff``, but the value we
+            # persist as the staleness watermark is backed off by a safety margin so a
+            # transaction that started before the cutoff yet commits after it is still
+            # seen as newer than the watermark on a later refresh. See
+            # ``_DELTA_WATERMARK_SAFETY_MARGIN`` for why an exact cutoff is unsafe.
+            persisted_watermark = refresh_cutoff - _DELTA_WATERMARK_SAFETY_MARGIN
 
             # Run reflect with the source query, excluding the mental model being refreshed
             # Skip creating a nested "hindsight.reflect" span since we already have "hindsight.mental_model_refresh"
@@ -11021,7 +11041,7 @@ class MemoryEngine(MemoryEngineInterface):
                             mental_model_id,
                             reflect_response=reflect_response_payload,
                             last_refreshed_source_query=current_source_query,
-                            refresh_watermark=refresh_cutoff,
+                            refresh_watermark=persisted_watermark,
                             request_context=request_context,
                         )
 
@@ -11129,7 +11149,7 @@ class MemoryEngine(MemoryEngineInterface):
                 content=final_content,
                 reflect_response=reflect_response_payload,
                 last_refreshed_source_query=current_source_query,
-                refresh_watermark=refresh_cutoff,
+                refresh_watermark=persisted_watermark,
                 structured_content=(final_structured.model_dump() if final_structured is not None else None),
                 request_context=request_context,
             )
@@ -11163,7 +11183,10 @@ class MemoryEngine(MemoryEngineInterface):
             tags: New tags (if changing)
             trigger: New trigger settings (if changing)
             reflect_response: Full reflect API response payload (if changing)
-            refresh_watermark: Snapshot cutoff consumed by a successful refresh
+            refresh_watermark: Watermark persisted by a successful refresh. This is
+                the snapshot cutoff backed off by ``_DELTA_WATERMARK_SAFETY_MARGIN``,
+                not the raw cutoff, so a late-committing straddling write is not
+                silently dropped. When None, ``last_refreshed_at`` advances to NOW().
             request_context: Request context for authentication
 
         Returns:
@@ -11243,8 +11266,10 @@ class MemoryEngine(MemoryEngineInterface):
                     param_idx += 1
             elif refresh_watermark is not None:
                 # A successful delta refresh can find no topic-relevant facts even
-                # though the coarse staleness query found new rows. Consume that
-                # window without re-embedding unchanged content or adding history.
+                # though the coarse staleness query found new rows. Advance the
+                # (margin-backed) watermark without re-embedding unchanged content or
+                # adding history, so the same no-op window stops re-triggering once it
+                # ages past the margin.
                 updates.append(f"last_refreshed_at = ${param_idx}")
                 params.append(refresh_watermark)
                 param_idx += 1

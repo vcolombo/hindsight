@@ -22,6 +22,7 @@ This file contains two kinds of tests:
 
 import os
 import uuid
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -29,6 +30,7 @@ import pytest
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.llm_wrapper import LLMConfig
 from hindsight_api.engine.maintenance import MaintenanceLoop
+from hindsight_api.engine.memory_engine import _DELTA_WATERMARK_SAFETY_MARGIN
 from hindsight_api.engine.response_models import ReflectResult
 from hindsight_api.engine.retain import embedding_utils
 
@@ -275,7 +277,7 @@ class TestDeltaRefreshPlumbing:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
-    async def test_delta_no_new_facts_advances_refresh_watermark(
+    async def test_delta_no_new_facts_advances_margin_backed_watermark(
         self,
         memory: MemoryEngine,
         request_context: RequestContext,
@@ -283,12 +285,15 @@ class TestDeltaRefreshPlumbing:
         patch_llm_call,
         monkeypatch,
     ):
-        """A successful no-op refresh must consume the current stale window.
+        """A successful no-op refresh advances the watermark — but only to a
+        margin-backed cutoff, not the raw snapshot instant.
 
-        The scheduled-refresh gate uses ``last_refreshed_at`` as its watermark. If
-        reflect finds no topic-relevant facts and that watermark stays unchanged,
-        the same unrelated memory makes every maintenance tick submit another LLM
-        refresh even though the previous operation completed successfully.
+        The scheduled-refresh gate uses ``last_refreshed_at`` as its watermark. If a
+        no-op refresh left it unchanged, one unrelated memory would make every
+        maintenance tick submit another LLM refresh forever. Advancing it stops that
+        storm once the window ages past the safety margin; keeping it a margin behind
+        the snapshot is what makes a late-committing straddling write recoverable (see
+        ``test_delta_refresh_watermark_survives_straddling_commit``).
         """
         bank_id = f"test-delta-watermark-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id, request_context=request_context)
@@ -303,9 +308,10 @@ class TestDeltaRefreshPlumbing:
             request_context=request_context,
         )
 
-        # Reproduce an established model whose cron is overdue, then add a fresh
-        # but topic-irrelevant fact. The coarse staleness query sees this row while
-        # the reflect agent correctly returns no supporting facts for the model.
+        # Established model whose cron is overdue, plus a topic-irrelevant fact that
+        # is already older than the safety margin. The coarse staleness query sees the
+        # row while the reflect agent correctly returns no supporting facts.
+        aged_beyond_margin = _DELTA_WATERMARK_SAFETY_MARGIN + timedelta(minutes=5)
         assert memory._pool is not None
         async with memory._pool.acquire() as conn:
             before = await conn.fetchval(
@@ -322,10 +328,12 @@ class TestDeltaRefreshPlumbing:
             await conn.execute(
                 """
                 INSERT INTO memory_units (id, bank_id, text, fact_type, tags, created_at, updated_at)
-                VALUES ($1, $2, 'The build server uses Linux.', 'world', ARRAY[]::varchar[], NOW(), NOW())
+                VALUES ($1, $2, 'The build server uses Linux.', 'world', ARRAY[]::varchar[],
+                        NOW() - $3::interval, NOW() - $3::interval)
                 """,
                 uuid.uuid4(),
                 bank_id,
+                aged_beyond_margin,
             )
             stale_row = await conn.fetchrow(
                 "SELECT id, tags, trigger, last_refreshed_at FROM mental_models WHERE bank_id = $1 AND id = $2",
@@ -360,6 +368,7 @@ class TestDeltaRefreshPlumbing:
                 bank_id,
                 mm["id"],
             )
+            post_now = await conn.fetchval("SELECT NOW()")
             assert mm_row is not None
             after = mm_row["last_refreshed_at"]
             is_stale = await memory.compute_mental_model_is_stale(conn, bank_id, mm_row)
@@ -368,7 +377,13 @@ class TestDeltaRefreshPlumbing:
                 bank_id,
                 mm["id"],
             )
+        # Advanced out of the day-old window, but held roughly one safety margin
+        # behind "now" rather than jumping to the raw snapshot cutoff.
         assert after > before
+        margin_behind = post_now - after
+        assert _DELTA_WATERMARK_SAFETY_MARGIN - timedelta(minutes=1) <= margin_behind
+        assert margin_behind <= _DELTA_WATERMARK_SAFETY_MARGIN + timedelta(minutes=1)
+        # The irrelevant fact is older than the margin, so the model settles: no storm.
         assert is_stale is False
         assert history_count == 0
 
@@ -386,7 +401,7 @@ class TestDeltaRefreshPlumbing:
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
-    async def test_delta_no_new_facts_preserves_memories_arriving_during_refresh(
+    async def test_delta_refresh_watermark_survives_straddling_commit(
         self,
         memory: MemoryEngine,
         request_context: RequestContext,
@@ -394,8 +409,18 @@ class TestDeltaRefreshPlumbing:
         patch_llm_call,
         monkeypatch,
     ):
-        """The refresh watermark must not pass facts excluded from its recall snapshot."""
-        bank_id = f"test-delta-cutoff-{uuid.uuid4().hex[:8]}"
+        """A memory whose transaction starts before the refresh snapshot but commits
+        after it must remain visible to a later refresh.
+
+        ``memory_units.updated_at`` is the writing transaction's start time, but the
+        row only becomes visible at COMMIT. A refresh that persisted its exact snapshot
+        cutoff would leave such a straddling row permanently below the watermark (its
+        start time predates the cutoff) even though reflect never saw it. The safety
+        margin keeps the persisted watermark behind the cutoff so the row still reads
+        as newer and is picked up next time. This is the case an exact-cutoff watermark
+        would silently drop.
+        """
+        bank_id = f"test-delta-straddle-{uuid.uuid4().hex[:8]}"
         await memory.get_bank_profile(bank_id, request_context=request_context)
         mm = await memory.create_mental_model(
             bank_id=bank_id,
@@ -419,41 +444,56 @@ class TestDeltaRefreshPlumbing:
                 mm["id"],
             )
 
+        # Open a transaction and insert a relevant memory, but hold the commit. Its
+        # updated_at is stamped now (transaction-start), *before* the refresh captures
+        # its cutoff, yet the row stays invisible until we commit mid-refresh.
+        straddle_conn = await memory._pool.acquire()
+        straddle_tx = straddle_conn.transaction()
+        await straddle_tx.start()
+        straddle_fact_id = uuid.uuid4()
+        await straddle_conn.execute(
+            """
+            INSERT INTO memory_units
+                (id, bank_id, text, fact_type, tags, created_at, updated_at)
+            VALUES
+                ($1, $2, 'The user now prefers detailed answers.', 'world',
+                 ARRAY[]::varchar[], NOW(), NOW())
+            """,
+            straddle_fact_id,
+            bank_id,
+        )
+
         reflect_calls = patch_reflect(memory, text="No relevant preference changes.", facts=[])
         delta_llm_calls = patch_llm_call(memory, returns="should-not-be-called")
         original_update = memory.update_mental_model
-        late_fact_id = uuid.uuid4()
+        straddle_committed = False
 
-        async def insert_late_fact_then_update(*args, **kwargs):
-            # refresh_mental_model has already consumed the reflect result when it
-            # reaches update_mental_model. Insert a fact in that exact race window.
-            assert memory._pool is not None
-            async with memory._pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO memory_units
-                        (id, bank_id, text, fact_type, tags, created_at, updated_at)
-                    VALUES
-                        ($1, $2, 'The user now prefers detailed answers.', 'world',
-                         ARRAY[]::varchar[], NOW(), NOW())
-                    """,
-                    late_fact_id,
-                    bank_id,
-                )
+        async def commit_straddle_then_update(*args, **kwargs):
+            nonlocal straddle_committed
+            # refresh has already captured its cutoff and finished reflect. Commit the
+            # previously-invisible row in this exact window, after the snapshot.
+            await straddle_tx.commit()
+            straddle_committed = True
             return await original_update(*args, **kwargs)
 
-        monkeypatch.setattr(memory, "update_mental_model", insert_late_fact_then_update)
+        monkeypatch.setattr(memory, "update_mental_model", commit_straddle_then_update)
 
-        refreshed = await memory.refresh_mental_model(
-            bank_id=bank_id,
-            mental_model_id=mm["id"],
-            request_context=request_context,
-        )
+        try:
+            refreshed = await memory.refresh_mental_model(
+                bank_id=bank_id,
+                mental_model_id=mm["id"],
+                request_context=request_context,
+            )
+        finally:
+            if not straddle_committed:
+                await straddle_tx.rollback()
+            await memory._pool.release(straddle_conn)
 
         assert refreshed is not None
         assert len(reflect_calls) == 1
-        assert reflect_calls[0].get("created_before") is not None
         assert len(delta_llm_calls) == 0
+        cutoff = reflect_calls[0].get("created_before")
+        assert cutoff is not None
 
         async with memory._pool.acquire() as conn:
             mm_row = await conn.fetchrow(
@@ -461,13 +501,19 @@ class TestDeltaRefreshPlumbing:
                 bank_id,
                 mm["id"],
             )
-            late_updated_at = await conn.fetchval(
+            straddle_updated_at = await conn.fetchval(
                 "SELECT updated_at FROM memory_units WHERE bank_id = $1 AND id = $2",
                 bank_id,
-                late_fact_id,
+                straddle_fact_id,
             )
             assert mm_row is not None
-            assert late_updated_at > mm_row["last_refreshed_at"]
+            after = mm_row["last_refreshed_at"]
+            # The straddling row's timestamp predates the snapshot cutoff: an exact
+            # cutoff watermark (pre-fix) would leave it below the watermark forever.
+            assert straddle_updated_at < cutoff
+            # The margin keeps the persisted watermark behind the cutoff, so the row
+            # still reads as newer and the model is correctly stale — not dropped.
+            assert after < straddle_updated_at
             assert await memory.compute_mental_model_is_stale(conn, bank_id, mm_row) is True
 
         await memory.delete_bank(bank_id, request_context=request_context)
