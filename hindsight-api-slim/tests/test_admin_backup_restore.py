@@ -357,6 +357,69 @@ async def test_backup_restore_preserves_all_column_types(backup_test_schema):
 
 
 @pytest.mark.asyncio
+async def test_backup_restore_includes_extension_table(backup_test_schema):
+    """An extension-declared bank-scoped table rides along backup + restore.
+
+    Simulates a table an extension provisions in the tenant schema (core knows
+    nothing about it). Passing the augmented ``backup_tables`` list — as
+    ``_effective_backup_tables()`` builds from ``TenantExtension.extra_bank_tables``
+    — must back it up AND restore it, so restore's ``TRUNCATE ... CASCADE`` can't
+    silently drop it.
+    """
+    db_url, schema_name, _fq, _embeddings = backup_test_schema
+    extra = "ext_audit_receipts"
+    effective = [*BACKUP_TABLES, extra]
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(f"CREATE TABLE {_fq(extra)} (id uuid PRIMARY KEY, bank_id text NOT NULL, payload text)")
+        kept_id = uuid.uuid4()
+        await conn.execute(
+            f"INSERT INTO {_fq(extra)} (id, bank_id, payload) VALUES ($1, $2, $3)",
+            kept_id,
+            "bank-x",
+            "original receipt",
+        )
+    finally:
+        await conn.close()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+        backup_path = Path(f.name)
+
+    try:
+        manifest = await _backup(db_url, backup_path, schema=schema_name, backup_tables=effective)
+        assert manifest["tables"][extra]["rows"] == 1
+
+        # Mutate after backup: a row that must NOT survive restore.
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(
+                f"INSERT INTO {_fq(extra)} (id, bank_id, payload) VALUES ($1, $2, $3)",
+                uuid.uuid4(),
+                "bank-x",
+                "post-backup row",
+            )
+        finally:
+            await conn.close()
+
+        await _restore(db_url, backup_path, schema=schema_name, backup_tables=effective)
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            rows = await conn.fetch(f"SELECT id, payload FROM {_fq(extra)}")
+        finally:
+            await conn.close()
+
+        # Restore reset the table to exactly its backed-up contents.
+        assert len(rows) == 1
+        assert rows[0]["id"] == kept_id
+        assert rows[0]["payload"] == "original receipt"
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
+
+
+@pytest.mark.asyncio
 async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(monkeypatch):
     """run-db-migration without --schema should include the base schema and deduplicate tenant schemas."""
     calls: dict[str, list] = {
