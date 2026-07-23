@@ -10,6 +10,7 @@ import tempfile
 import uuid
 import zipfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -460,6 +461,8 @@ async def test_run_migration_without_schema_discovers_and_deduplicates_schemas(m
     monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
     monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: MockTenantExtension())
     monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
 
     from hindsight_api import migrations as migrations_module
 
@@ -530,6 +533,8 @@ async def test_run_migration_without_schema_runs_optional_post_migration_hooks(m
 
     monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: MockTenantExtension())
     monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
 
     from hindsight_api import migrations as migrations_module
 
@@ -600,6 +605,8 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
 
     monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: MockTenantExtension())
     monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
 
     from hindsight_api import migrations as migrations_module
 
@@ -638,6 +645,8 @@ async def test_run_migration_threads_ensure_extensions_flag(monkeypatch, ensure_
 
     monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: None)
     monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+    # Extension-table provisioning does a real connect; these tests mock the DB, so stub it.
+    monkeypatch.setattr(admin_cli, "_provision_extra_bank_tables", AsyncMock())
 
     from hindsight_api import migrations as migrations_module
 
